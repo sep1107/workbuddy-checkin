@@ -16,8 +16,8 @@ WorkBuddy 是 Electron 应用，不同操作系统下 UI 自动化方案不同�
 ### 1. 克隆仓库
 
 ```bash
-git clone https://github.com/sep1107/wb-checkin.git
-cd wb-checkin/scripts
+git clone https://github.com/sep1107/workbuddy-checkin.git
+cd workbuddy-checkin/scripts
 ```
 
 ### 2. 安装依赖

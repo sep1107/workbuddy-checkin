@@ -1,5 +1,5 @@
 ---
-name: wb-checkin-macos
+name: workbuddy-checkin
 description: "Automate WorkBuddy daily check-in (签到领积分) on macOS and Windows. Cross-platform entry script auto-detects OS and runs the platform-specific implementation: macOS uses screenshot analysis + CGEvent mouse simulation (bypasses Electron's inaccessible DOM); Windows uses uiautomation accessibility tree. Use when the user asks to set up, run, troubleshoot, or schedule WorkBuddy auto check-in. Covers Pillow image analysis, coordinate mapping, CGEvent clicking, uiautomation, screen reader flag, debug/dry-run mode, and daily scheduling."
 ---
 
