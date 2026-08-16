@@ -198,4 +198,4 @@ Windows 脚本顶部可调参数：
 - `scripts/wb_checkin.py` — 跨平台入口脚本（自动选择平台）
 - `scripts/wb_checkin_macos.py` — macOS 实现（截屏分析 + CGEvent，需 Pillow）
 - `scripts/wb_checkin_windows.py` — Windows 实现（uiautomation，需 uiautomation 库）
-- `references/wb_checkin_说明.md` — 详细设置、配置、launchd/计划任务模板和故障排查指南
+- `README.md` — 面向公众的快速开始、权限设置、定时任务模板和故障排查
