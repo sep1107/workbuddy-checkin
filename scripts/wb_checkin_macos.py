@@ -1,10 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WorkBuddy 每日签到自动领取积分脚本 (macOS 版 v3)
+WorkBuddy 每日签到自动领取积分脚本 (macOS 版 v3.1)
 ================================================
 v3 完全重写：抛弃辅助功能树方案（Electron 不暴露 DOM），
 改用截屏分析 + CGEvent 鼠标模拟。
+v3.1 改进（2026-08-17）：
+  - 去除 System Events/AppleScript 硬依赖：
+    * 窗口位置优先用 CGWindowListCopyWindowInfo（CoreGraphics，无权限依赖）
+    * 进程检测改用 pgrep，应用激活改用 open -a
+    * 解决 osascript 报"权限违例 -10004"导致签到失败的问题
+  - "今日已领"检测增加按钮形状 + 深色卡片上下文过滤，
+    防止把聊天页面的灰色元素误判为已签到（05:25 误判教训）
+v3.2 改进（2026-08-17）：
+  - 回退流程重构：点击头像后重新截屏并在窗口内用 find_dark_card
+    重新检测签到卡片，而非直接在全屏范围找亮色按钮
+  - find_bright_button 支持 win_rect 参数，限制搜索范围到 WorkBuddy 窗口内
+    防止点击到其他应用窗口（06:03 误点击 (1092,624) 切换到 Chrome 的教训）
+  - 主流程弹窗按钮搜索也限制到窗口范围内
 
 技术方案:
   1. System Events 获取窗口位置（points 坐标系）
@@ -37,7 +50,6 @@ import logging
 import argparse
 from datetime import datetime
 from collections import deque
-
 try:
     from PIL import Image, ImageDraw
 except ImportError:
@@ -67,6 +79,12 @@ DIALOG_SEARCH = (0.20, 0.80, 0.30, 0.85)
 
 # 截图差异判定（窗口区域内，1% 以上视为有变化）
 DIFF_THRESHOLD = 0.01
+
+# v3.2: 点击头像后弹出下拉菜单，需要点击"Buddy 加油站"条目
+# 才能打开签到卡片。菜单从头像向上展开，"Buddy 加油站"是第3个条目
+# 相对窗口位置 (x_ratio, y_ratio)
+# 2026-08-17 实测: 文本中心在窗口 x≈110, y≈278 points
+MENU_BUDDY_RATIO = (0.11, 0.37)
 
 # ==================== CGEvent 鼠标模拟 ====================
 
@@ -127,30 +145,39 @@ def osa(script, timeout=15):
 
 
 def ensure_running(name=APP_NAME):
-    """确保应用正在运行，如未运行则启动。返回是否已经在运行。"""
-    out, _ = osa(
-        'tell application "System Events" to return '
-        f'(name of every process) contains "{name}"'
-    )
-    if out != "true":
-        # 也检查 Electron 进程名
-        out2, _ = osa(
-            'tell application "System Events" to return '
-            '(name of every process) contains "Electron"'
+    """确保应用正在运行，如未运行则启动。返回是否已经在运行。
+    v3.1: 不再依赖 System Events，改用 pgrep 检测进程。"""
+    try:
+        r = subprocess.run(
+            ['pgrep', '-x', name], capture_output=True, text=True, timeout=5
         )
-        if out2 != "true":
-            logging.info(f"{name} 未运行，正在启动...")
-            subprocess.run(['open', '-a', name], timeout=30)
-            time.sleep(12)
-            return False
-    return True
+        if r.returncode == 0:
+            return True
+        # Electron 主进程可能叫 Electron（WorkBuddy.app 可执行文件名）
+        r2 = subprocess.run(
+            ['pgrep', '-f', f'{name}.app'], capture_output=True, text=True, timeout=5
+        )
+        if r2.returncode == 0:
+            return True
+    except Exception as e:
+        logging.warning(f"pgrep 检测失败: {e}")
+    logging.info(f"{name} 未运行，正在启动...")
+    subprocess.run(['open', '-a', name], timeout=30)
+    time.sleep(12)
+    return False
 
 
 def activate_app(name=APP_NAME):
-    """激活应用窗口并置于最前。"""
+    """激活应用窗口并置于最前。
+    v3.1: 优先 open -a（无需自动化权限），失败再尝试 AppleScript。"""
+    try:
+        subprocess.run(['open', '-a', name], timeout=10)
+        time.sleep(1.5)
+        return
+    except Exception as e:
+        logging.warning(f"open -a 激活失败: {e}，回退 AppleScript")
     osa(f'tell application "{name}" to activate')
     time.sleep(1.5)
-    # 尝试两个进程名
     for proc in PROCESS_NAMES:
         out, _ = osa(
             f'tell application "System Events" to '
@@ -161,8 +188,122 @@ def activate_app(name=APP_NAME):
     time.sleep(0.5)
 
 
+# ==================== CoreGraphics 窗口检测（无需自动化权限） ====================
+
+def _load_cf():
+    """加载 CoreFoundation 并配置常用函数签名。"""
+    cf = ctypes.cdll.LoadLibrary(
+        '/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation'
+    )
+    cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+    cf.CFStringCreateWithCString.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32
+    ]
+    cf.CFDictionaryGetValue.restype = ctypes.c_void_p
+    cf.CFDictionaryGetValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    cf.CFNumberGetValue.restype = ctypes.c_int
+    cf.CFNumberGetValue.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p
+    ]
+    cf.CFArrayGetCount.restype = ctypes.c_long
+    cf.CFArrayGetCount.argtypes = [ctypes.c_void_p]
+    cf.CFArrayGetValueAtIndex.restype = ctypes.c_void_p
+    cf.CFArrayGetValueAtIndex.argtypes = [ctypes.c_void_p, ctypes.c_long]
+    cf.CFRelease.argtypes = [ctypes.c_void_p]
+    cf.CFStringGetCString.restype = ctypes.c_int
+    cf.CFStringGetCString.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32
+    ]
+    return cf
+
+
+def get_window_rect_cg(name=APP_NAME):
+    """通过 CGWindowListCopyWindowInfo 获取 WorkBuddy 主窗口位置（points）。
+    不依赖 System Events / 自动化权限，仅需普通 API 调用。
+    注意: CFArray/CFDictionary 等辅助函数必须通过 CoreFoundation 句柄调用，
+    通过 CoreGraphics 句柄调用会造成段错误。
+    返回 (x, y, w, h) 或 None。"""
+    try:
+        cg = ctypes.cdll.LoadLibrary(
+            '/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics'
+        )
+        cf = _load_cf()
+        cg.CGWindowListCopyWindowInfo.restype = ctypes.c_void_p
+        cg.CGWindowListCopyWindowInfo.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+
+        kCGWindowListOptionOnScreenOnly = 0x10
+        info = cg.CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, 0)
+        if not info:
+            return None
+        n = cf.CFArrayGetCount(ctypes.c_void_p(info))
+
+        def cfstr(s):
+            return cf.CFStringCreateWithCString(None, s.encode(), 0)
+
+        def get_str(d, key):
+            v = cf.CFDictionaryGetValue(ctypes.c_void_p(d), ctypes.c_void_p(key))
+            if not v:
+                return ''
+            buf = ctypes.create_string_buffer(256)
+            # kCFStringEncodingUTF8
+            if cf.CFStringGetCString(v, buf, 256, 0x08000100):
+                return buf.value.decode('utf-8', 'ignore')
+            return ''
+
+        def get_num(b, key):
+            v = cf.CFDictionaryGetValue(ctypes.c_void_p(b), ctypes.c_void_p(key))
+            if not v:
+                return None
+            f = ctypes.c_double()
+            # kCFNumberFloat64Type = 6
+            if not cf.CFNumberGetValue(v, 6, ctypes.byref(f)):
+                return None
+            return f.value
+
+        k_owner = cfstr('kCGWindowOwnerName')
+        k_bounds = cfstr('kCGWindowBounds')
+        k_x = cfstr('X')
+        k_y = cfstr('Y')
+        k_w = cfstr('Width')
+        k_h = cfstr('Height')
+
+        best = None
+        best_area = 0
+        for i in range(n):
+            d = cf.CFArrayGetValueAtIndex(ctypes.c_void_p(info), i)
+            if not d:
+                continue
+            owner = get_str(d, k_owner)
+            if owner != name:
+                continue
+            b = cf.CFDictionaryGetValue(ctypes.c_void_p(d), ctypes.c_void_p(k_bounds))
+            if not b:
+                continue
+            x = get_num(b, k_x)
+            y = get_num(b, k_y)
+            w = get_num(b, k_w)
+            h = get_num(b, k_h)
+            if None in (x, y, w, h) or w < 200 or h < 200:
+                continue
+            area = w * h
+            if area > best_area:
+                best_area = area
+                best = (int(x), int(y), int(w), int(h))
+        cf.CFRelease(ctypes.c_void_p(info))
+        return best
+    except Exception as e:
+        logging.warning(f"CGWindowList 检测失败: {e}")
+        return None
+
+
 def get_window_rect(name=APP_NAME):
-    """获取前台窗口位置和大小（points）。返回 (x, y, w, h) 或 None。"""
+    """获取前台窗口位置和大小（points）。返回 (x, y, w, h) 或 None。
+    v3.1: 优先 CoreGraphics（无权限依赖），失败回退 System Events。"""
+    rect = get_window_rect_cg(name)
+    if rect:
+        logging.info(f"窗口位置(CGWindowList): ({rect[0]}, {rect[1]}) {rect[2]}x{rect[3]}")
+        return rect
+
     for proc in PROCESS_NAMES:
         script = f'''
         tell application "System Events"
@@ -375,10 +516,107 @@ def find_dark_card(win_img, search=CARD_SEARCH, threshold=DARK_THRESHOLD):
     )
 
 
-def find_claimed_button(win_img, search=CARD_SEARCH, gray_range=(70, 170)):
+def find_dark_button(win_img, search=CARD_SEARCH, threshold=55):
+    """
+    在窗口截图中搜索深色的"立即领取"按钮。
+    新版卡片为浅色背景，按钮是深色独立连通区域，不会被 find_dark_card 覆盖。
+    返回按钮 bbox (left, top, right, bottom) 窗口截图像素坐标，或 None。
+    """
+    w, h = win_img.size
+    left = int(w * search[0])
+    right = int(w * search[1])
+    top = int(h * search[2])
+    bottom = int(h * search[3])
+
+    region = win_img.crop((left, top, right, bottom)).convert('L')
+    rw, rh = region.size
+    px = region.load()
+
+    # 二值掩码：深色像素
+    mask = [bytearray(rh) for _ in range(rw)]
+    for y in range(rh):
+        for x in range(rw):
+            if px[x, y] < threshold:
+                mask[x][y] = 1
+
+    visited = [bytearray(rh) for _ in range(rw)]
+    components = []
+
+    for y in range(rh):
+        for x in range(rw):
+            if not mask[x][y] or visited[x][y]:
+                continue
+
+            queue = deque([(x, y)])
+            visited[x][y] = 1
+            pixels = [(x, y)]
+            min_x, max_x = x, x
+            min_y, max_y = y, y
+
+            while queue:
+                cx, cy = queue.popleft()
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        if dx == 0 and dy == 0:
+                            continue
+                        nx, ny = cx + dx, cy + dy
+                        if 0 <= nx < rw and 0 <= ny < rh:
+                            if mask[nx][ny] and not visited[nx][ny]:
+                                visited[nx][ny] = 1
+                                queue.append((nx, ny))
+                                pixels.append((nx, ny))
+                                if nx < min_x: min_x = nx
+                                if nx > max_x: max_x = nx
+                                if ny < min_y: min_y = ny
+                                if ny > max_y: max_y = ny
+
+            bw = max_x - min_x + 1
+            bh = max_y - min_y + 1
+            if bw < 50 or bh < 24 or len(pixels) < 150:
+                continue
+
+            # 按钮形状过滤
+            aspect = bw / bh
+            density = len(pixels) / (bw * bh)
+            if not (1.5 <= aspect <= 12):
+                continue
+            if not (60 <= bw <= 360 and 24 <= bh <= 90):
+                continue
+            if density < 0.35:
+                continue
+
+            cx = (min_x + max_x) / 2
+            cy = (min_y + max_y) / 2
+            # 位置打分：左下优先
+            pos_score = (cy / rh) * 0.5 + (1 - cx / rw) * 0.5
+            shape_score = 1.0 if (2.0 <= aspect <= 8.0) else 0.7
+            total = pos_score * 0.6 + shape_score * 0.4
+
+            components.append({
+                'bbox': (min_x, min_y, max_x, max_y),
+                'score': total,
+            })
+
+    if not components:
+        return None
+
+    components.sort(key=lambda c: c['score'], reverse=True)
+    best = components[0]
+    if best['score'] < 0.3:
+        return None
+
+    bbox = best['bbox']
+    return (
+        left + bbox[0], top + bbox[1],
+        left + bbox[2], top + bbox[3],
+    )
+
+
+def find_claimed_button(win_img, search=CARD_SEARCH, gray_range=(70, 240)):
     """
     检测是否已经签到：查找灰色的"今日已领"按钮。
     返回 bbox (left, top, right, bottom) 窗口截图像素坐标，或 None。
+    v3.2: 新版卡片为浅色背景，按钮背景更浅（200-220 灰度），放宽范围到 (70, 240)。
     """
     w, h = win_img.size
     left = int(w * search[0])
@@ -434,39 +672,78 @@ def find_claimed_button(win_img, search=CARD_SEARCH, gray_range=(70, 170)):
             if bw < 40 or bh < 18 or len(pixels) < 200:
                 continue
 
+            # v3.1/v3.2: 按钮形状过滤，防止把无关灰色块（输入框/其他UI）误判为"今日已领"
+            density = len(pixels) / (bw * bh)
+            aspect = bw / bh
+            if not (80 <= bw <= 420 and 28 <= bh <= 90):
+                continue
+            if not (1.5 <= aspect <= 10 or density > 0.8):
+                continue
+
+            # v3.2: 不再强制要求上方深色背景（新版卡片为浅色），改为综合打分
+            dark_above = 0
+            band_top = max(0, min_y - 50)
+            for dy in range(band_top, min_y):
+                for dx in range(max(0, min_x - 20), min(rw, max_x + 20), 2):
+                    if px[dx, dy] < 80:
+                        dark_above += 1
+
+            cx = (min_x + max_x) / 2
+            cy = (min_y + max_y) / 2
+
+            # 位置打分：越靠近左下角越好（卡片按钮都在左下）
+            pos_score = (cy / rh) * 0.5 + (1 - cx / rw) * 0.5
+            # 上下文打分：上方有深色背景加分（旧版深色卡片）
+            context_score = min(dark_above / 30.0, 1.0)
+            # 形状打分：长宽比接近按钮形状更好
+            shape_score = 1.0 if 1.5 <= aspect <= 10 else 0.6
+
+            # 综合：位置权重最高，其次是上下文，形状保底
+            total = pos_score * 0.55 + context_score * 0.25 + shape_score * 0.20
+
+            # 只保留位于搜索区域下半部分的候选（排除聊天区上方的灰色块）
+            if cy < rh * 0.55:
+                continue
+
             components.append({
                 'bbox': (min_x, min_y, max_x, max_y),
-                'pixels': pixels,
+                'score': total,
             })
 
     if not components:
         return None
 
-    # 选择位置最靠左下的组件
-    def score(comp):
-        bbox = comp['bbox']
-        cx = (bbox[0] + bbox[2]) / 2
-        cy = (bbox[1] + bbox[3]) / 2
-        return (cy / rh) * 0.5 + (1 - cx / rw) * 0.5
+    components.sort(key=lambda c: c['score'], reverse=True)
+    best = components[0]
+    if best['score'] < 0.35:
+        return None
 
-    components.sort(key=score, reverse=True)
-    best = components[0]['bbox']
+    bbox = best['bbox']
     return (
-        left + best[0], top + best[1],
-        left + best[2], top + best[3],
+        left + bbox[0], top + bbox[1],
+        left + bbox[2], top + bbox[3],
     )
 
 
-def find_bright_button(img, search=DIALOG_SEARCH):
+def find_bright_button(img, search=DIALOG_SEARCH, win_rect=None, scale=2.0):
     """
     在截图中搜索亮色按钮区域（弹窗中的签到按钮）。
     返回按钮中心 (x, y) 全屏截图像素坐标，或 None。
+    v3.2: 如果提供 win_rect (x, y, w, h in points)，则限制搜索范围到窗口区域内，
+    防止把其他应用的亮色 UI 误判为签到按钮。
     """
-    w, h = img.size
-    left = int(w * search[0])
-    right = int(w * search[1])
-    top = int(h * search[2])
-    bottom = int(h * search[3])
+    if win_rect:
+        wx, wy, ww, wh = win_rect
+        left = int(wx * scale)
+        right = int((wx + ww) * scale)
+        top = int(wy * scale)
+        bottom = int((wy + wh) * scale)
+    else:
+        w, h = img.size
+        left = int(w * search[0])
+        right = int(w * search[1])
+        top = int(h * search[2])
+        bottom = int(h * search[3])
 
     region = img.crop((left, top, right, bottom)).convert('RGB')
     px = region.load()
@@ -549,7 +826,7 @@ def save_debug(img, name, debug, overlay=None):
 def run_checkin(debug=False, dry_run=False):
     """执行签到流程。返回 True 表示流程完成。"""
     logging.info("=" * 50)
-    logging.info("WorkBuddy 每日签到开始 (v3 截屏分析模式)")
+    logging.info("WorkBuddy 每日签到开始 (v3.2 截屏分析模式)")
 
     if debug:
         os.makedirs(DEBUG_DIR, exist_ok=True)
@@ -578,86 +855,198 @@ def run_checkin(debug=False, dry_run=False):
     win_img = crop_window(before_img, rect, scale)
     save_debug(win_img, "02_window.png", debug)
 
-    # 6. 查找深色"Buddy加油站"可点击按钮
+    # 6. 查找"立即领取"深色按钮（新版浅色卡片）
+    dark_btn = find_dark_button(win_img)
+    if dark_btn:
+        db_l, db_t, db_r, db_b = dark_btn
+        db_w = db_r - db_l
+        db_h = db_b - db_t
+        click_x = win_x + (db_l + db_w * 0.5) / scale
+        click_y = win_y + (db_t + db_h * 0.5) / scale
+        logging.info(f"找到深色'立即领取'按钮 ({click_x:.0f}, {click_y:.0f})")
+        if debug:
+            overlay = [
+                {'kind': 'rect', 'bbox': (db_l, db_t, db_r, db_b), 'color': 'red'},
+            ]
+            save_debug(win_img.copy(), "02_window_dark_btn.png", debug, overlay=overlay)
+        if not dry_run:
+            cg_click(click_x, click_y)
+            time.sleep(2.5)
+            after_img = screenshot()
+            save_debug(after_img, "03_after_click.png", debug)
+            after_win = crop_window(after_img, rect, scale)
+            if images_different(win_img, after_win, threshold=DIFF_THRESHOLD):
+                logging.info("检测到窗口变化，查找弹窗按钮...")
+                btn = find_bright_button(after_img, win_rect=rect, scale=scale)
+                if btn:
+                    bx = btn[0] / scale
+                    by = btn[1] / scale
+                    logging.info(f"找到弹窗按钮，点击 ({bx:.0f}, {by:.0f})")
+                    cg_click(bx, by)
+                    time.sleep(2)
+                    final = screenshot()
+                    save_debug(final, "04_final.png", debug)
+                    logging.info("签到流程完成")
+                else:
+                    logging.info("未找到弹窗按钮，检查是否已直接签到...")
+                    final_win = crop_window(after_img, rect, scale)
+                    if find_claimed_button(final_win):
+                        logging.info("验证: 检测到'今日已领'状态，签到成功")
+                    else:
+                        logging.info("未找到弹窗按钮，可能已直接签到")
+            else:
+                logging.info("点击后窗口无变化，可能未命中按钮")
+        return True
+
+    # 7. 查找"今日已领"灰色按钮
+    claimed = find_claimed_button(win_img)
+    if claimed:
+        logging.info("检测到'今日已领'状态，今日已签到，无需操作")
+        if debug:
+            overlay = [
+                {'kind': 'rect', 'bbox': claimed, 'color': 'green'},
+            ]
+            save_debug(win_img.copy(), "02_window_claimed.png", debug, overlay=overlay)
+        return True
+
+    # 8. 查找旧版深色"Buddy加油站"卡片
     card = find_dark_card(win_img)
-    if not card:
-        logging.info("未找到深色可点击按钮，尝试检测是否已签到...")
-        claimed = find_claimed_button(win_img)
+    if card:
+        card_l, card_t, card_r, card_b = card
+        card_w = card_r - card_l
+        card_h = card_b - card_t
+        logging.info(
+            f"找到旧版深色卡片: ({card_l},{card_t})-({card_r},{card_b}) px, "
+            f"大小 {card_w}x{card_h} px"
+        )
+        if debug:
+            overlay = [
+                {'kind': 'rect', 'bbox': (card_l, card_t, card_r, card_b), 'color': 'red'},
+            ]
+            save_debug(win_img.copy(), "02_window_detected.png", debug, overlay=overlay)
+
+        if dry_run:
+            logging.info("Dry run 模式，不执行点击")
+            return True
+
+        # 依次尝试点击目标区域内的不同位置（中心 + 左右偏移）
+        click_offsets = [0.50, 0.35, 0.65]
+        for i, ox in enumerate(click_offsets):
+            btn_px = card_l + int(card_w * ox)
+            btn_py = card_t + int(card_h * 0.5)
+            click_x = win_x + btn_px / scale
+            click_y = win_y + btn_py / scale
+
+            logging.info(
+                f"尝试 {i+1}/{len(click_offsets)}: "
+                f"目标内 x={ox:.0%} → 屏幕 ({click_x:.0f}, {click_y:.0f})"
+            )
+
+            cg_click(click_x, click_y)
+            time.sleep(2.5)
+
+            # 截屏验证（只比较 WorkBuddy 窗口区域，避免全屏其他 UI 干扰）
+            after_img = screenshot()
+            save_debug(after_img, f"03_after_click_{i+1}.png", debug)
+            after_win = crop_window(after_img, rect, scale)
+
+            if images_different(win_img, after_win, threshold=DIFF_THRESHOLD):
+                logging.info("检测到 WorkBuddy 窗口变化，查找弹窗按钮...")
+
+                # 查找弹窗中的亮色按钮（v3.2: 限制在窗口范围内）
+                btn = find_bright_button(after_img, win_rect=rect, scale=scale)
+                if btn:
+                    bx = btn[0] / scale
+                    by = btn[1] / scale
+                    logging.info(f"找到弹窗按钮，点击 ({bx:.0f}, {by:.0f})")
+                    cg_click(bx, by)
+                    time.sleep(2)
+                    final = screenshot()
+                    save_debug(final, "04_final.png", debug)
+                    logging.info("签到流程完成（已点击弹窗按钮）")
+                else:
+                    logging.info("未找到弹窗按钮，可能已直接签到")
+                return True
+
+            logging.info(f"位置 {ox:.0%} 无反应，尝试下一个位置")
+
+        logging.info("所有卡片位置均无反应，可能今日已签到或卡片不可点击")
+        return True
+
+    # 9. 回退流程: 未检测到任何已知按钮/卡片，尝试点击头像→菜单→签到卡片
+    logging.info("未找到签到卡片，可能卡片不可见；回退点击头像区域")
+    avatar_x = win_x + win_w * 0.08
+    avatar_y = win_y + win_h * 0.95
+    logging.info(f"回退策略: 点击头像区域 ({avatar_x:.0f}, {avatar_y:.0f})")
+    if not dry_run:
+        cg_click(avatar_x, avatar_y)
+        time.sleep(2.5)
+
+        # v3.2: 点击头像后弹出下拉菜单，需要点击"Buddy 加油站"条目
+        menu_x = win_x + win_w * MENU_BUDDY_RATIO[0]
+        menu_y = win_y + win_h * MENU_BUDDY_RATIO[1]
+        logging.info(f"点击下拉菜单'Buddy 加油站' ({menu_x:.0f}, {menu_y:.0f})")
+        cg_click(menu_x, menu_y)
+        time.sleep(3)
+
+        # 重新截屏检测
+        after_menu = screenshot()
+        save_debug(after_menu, "03_after_menu.png", debug)
+        after_win = crop_window(after_menu, rect, scale)
+        save_debug(after_win, "03_after_menu_window.png", debug)
+
+        # v3.2: 先检查深色"立即领取"按钮（新版未签到状态）
+        dark_btn2 = find_dark_button(after_win)
+        if dark_btn2:
+            db2_l, db2_t, db2_r, db2_b = dark_btn2
+            db2_w = db2_r - db2_l
+            db2_h = db2_b - db2_t
+            click2_x = win_x + (db2_l + db2_w * 0.5) / scale
+            click2_y = win_y + (db2_t + db2_h * 0.5) / scale
+            logging.info(f"菜单后找到深色'立即领取'按钮 ({click2_x:.0f}, {click2_y:.0f})")
+            cg_click(click2_x, click2_y)
+            time.sleep(2.5)
+            after_card = screenshot()
+            save_debug(after_card, "04_after_card.png", debug)
+            btn = find_bright_button(after_card, win_rect=rect, scale=scale)
+            if btn:
+                bx = btn[0] / scale
+                by = btn[1] / scale
+                logging.info(f"找到弹窗按钮，点击 ({bx:.0f}, {by:.0f})")
+                cg_click(bx, by)
+                time.sleep(2)
+                logging.info("签到流程完成（回退: 头像→菜单→深色按钮→弹窗）")
+            else:
+                logging.info("未找到弹窗按钮，可能已直接签到")
+            return True
+
+        # 检查是否已签到（v3.2: 卡片可能是"今日已领"状态）
+        claimed = find_claimed_button(after_win)
         if claimed:
             logging.info("检测到'今日已领'状态，今日已签到，无需操作")
             if debug:
                 overlay = [
                     {'kind': 'rect', 'bbox': claimed, 'color': 'green'},
                 ]
-                save_debug(win_img.copy(), "02_window_claimed.png", debug, overlay=overlay)
+                save_debug(after_win.copy(), "03_after_menu_claimed.png", debug, overlay=overlay)
             return True
 
-        logging.info("未找到签到卡片，可能卡片不可见；回退点击头像区域")
-        avatar_x = win_x + win_w * 0.08
-        avatar_y = win_y + win_h * 0.95
-        logging.info(f"回退策略: 点击头像区域 ({avatar_x:.0f}, {avatar_y:.0f})")
-        if not dry_run:
-            cg_click(avatar_x, avatar_y)
-            time.sleep(2)
-            after_avatar = screenshot()
-            save_debug(after_avatar, "03_after_avatar.png", debug)
-            btn = find_bright_button(after_avatar)
-            if btn:
-                bx = btn[0] / scale
-                by = btn[1] / scale
-                logging.info(f"找到菜单按钮，点击 ({bx:.0f}, {by:.0f})")
-                cg_click(bx, by)
-                time.sleep(2)
-                final = screenshot()
-                save_debug(final, "04_final.png", debug)
-        logging.info("回退流程完成")
-        return True
+        # 查找旧版签到卡片
+        card2 = find_dark_card(after_win)
+        if card2:
+            logging.info("点击菜单后检测到签到卡片")
+            c2_l, c2_t, c2_r, c2_b = card2
+            c2_w = c2_r - c2_l
+            c2_h = c2_b - c2_t
+            click2_x = win_x + (c2_l + c2_w * 0.5) / scale
+            click2_y = win_y + (c2_t + c2_h * 0.5) / scale
+            logging.info(f"点击卡片中心 ({click2_x:.0f}, {click2_y:.0f})")
+            cg_click(click2_x, click2_y)
+            time.sleep(2.5)
 
-    card_l, card_t, card_r, card_b = card
-    card_w = card_r - card_l
-    card_h = card_b - card_t
-    logging.info(
-        f"找到目标: ({card_l},{card_t})-({card_r},{card_b}) px, "
-        f"大小 {card_w}x{card_h} px"
-    )
-
-    # 在窗口截图上绘制检测框和点击点
-    if debug:
-        overlay = [
-            {'kind': 'rect', 'bbox': (card_l, card_t, card_r, card_b), 'color': 'red'},
-        ]
-        save_debug(win_img.copy(), "02_window_detected.png", debug, overlay=overlay)
-
-    if dry_run:
-        logging.info("Dry run 模式，不执行点击")
-        return True
-
-    # 7. 依次尝试点击目标区域内的不同位置（中心 + 左右偏移）
-    click_offsets = [0.50, 0.35, 0.65]
-    for i, ox in enumerate(click_offsets):
-        btn_px = card_l + int(card_w * ox)
-        btn_py = card_t + int(card_h * 0.5)
-        click_x = win_x + btn_px / scale
-        click_y = win_y + btn_py / scale
-
-        logging.info(
-            f"尝试 {i+1}/{len(click_offsets)}: "
-            f"目标内 x={ox:.0%} → 屏幕 ({click_x:.0f}, {click_y:.0f})"
-        )
-
-        cg_click(click_x, click_y)
-        time.sleep(2.5)
-
-        # 8. 截屏验证（只比较 WorkBuddy 窗口区域，避免全屏其他 UI 干扰）
-        after_img = screenshot()
-        save_debug(after_img, f"03_after_click_{i+1}.png", debug)
-        after_win = crop_window(after_img, rect, scale)
-
-        if images_different(win_img, after_win, threshold=DIFF_THRESHOLD):
-            logging.info("检测到 WorkBuddy 窗口变化，查找弹窗按钮...")
-
-            # 9. 查找弹窗中的亮色按钮
-            btn = find_bright_button(after_img)
+            after_card = screenshot()
+            save_debug(after_card, "04_after_card.png", debug)
+            btn = find_bright_button(after_card, win_rect=rect, scale=scale)
             if btn:
                 bx = btn[0] / scale
                 by = btn[1] / scale
@@ -665,16 +1054,37 @@ def run_checkin(debug=False, dry_run=False):
                 cg_click(bx, by)
                 time.sleep(2)
                 final = screenshot()
-                save_debug(final, "04_final.png", debug)
-                logging.info("签到流程完成（已点击弹窗按钮）")
+                save_debug(final, "05_final.png", debug)
+
+                final_win = crop_window(final, rect, scale)
+                if find_claimed_button(final_win):
+                    logging.info("验证: 检测到'今日已领'状态，签到成功")
+                else:
+                    logging.info("签到流程完成（回退: 头像→菜单→卡片→弹窗）")
             else:
-                logging.info("未找到弹窗按钮，可能已直接签到")
-            return True
-
-        logging.info(f"位置 {ox:.0%} 无反应，尝试下一个位置")
-
-    # 10. 所有位置都试过
-    logging.info("所有按钮位置均无反应，可能今日已签到或卡片不可点击")
+                logging.info("未找到弹窗按钮，检查是否已签到...")
+                final_win = crop_window(after_card, rect, scale)
+                if find_claimed_button(final_win):
+                    logging.info("验证: 检测到'今日已领'状态，签到成功（无需弹窗）")
+                else:
+                    logging.info("未找到弹窗按钮，可能已直接签到")
+        else:
+            logging.info("点击菜单后仍未找到签到卡片")
+            # 最后尝试: 在窗口范围内搜索亮色按钮
+            btn = find_bright_button(after_menu, win_rect=rect, scale=scale)
+            if btn:
+                bx = btn[0] / scale
+                by = btn[1] / scale
+                logging.info(f"窗口内找到亮色按钮，点击 ({bx:.0f}, {by:.0f})")
+                cg_click(bx, by)
+                time.sleep(2)
+                final = screenshot()
+                save_debug(final, "04_final.png", debug)
+                logging.info("回退流程完成（窗口内亮色按钮）")
+            else:
+                logging.info("回退流程完成，未找到可点击目标")
+    else:
+        logging.info("Dry run 模式，不执行回退点击")
     return True
 
 
