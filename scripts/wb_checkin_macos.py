@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WorkBuddy 每日签到自动领取积分脚本 (macOS 版 v3.1)
+WorkBuddy 每日签到自动领取积分脚本 (macOS 版 v3.2)
 ================================================
 v3 完全重写：抛弃辅助功能树方案（Electron 不暴露 DOM），
 改用截屏分析 + CGEvent 鼠标模拟。
@@ -20,14 +20,14 @@ v3.2 改进（2026-08-17）：
   - 主流程弹窗按钮搜索也限制到窗口范围内
 
 技术方案:
-  1. System Events 获取窗口位置（points 坐标系）
+  1. CGWindowListCopyWindowInfo 获取窗口位置（points 坐标系，无需自动化权限）
   2. screencapture 截屏（physical pixels）
-  3. Pillow 图像分析：在左下角搜索深色"Buddy加油站"卡片
-  4. CGEvent 模拟点击卡片"立即领取"按钮
+  3. Pillow 图像分析：检测深色"立即领取"按钮 / 灰色"今日已领"按钮 / 旧版深色卡片
+  4. CGEvent 模拟点击按钮
   5. 截屏对比验证：检测弹窗，如有则继续点击签到按钮
 
 坐标体系:
-  - System Events 窗口位置: points（逻辑坐标）
+  - CGWindowList 窗口位置: points（逻辑坐标）
   - screencapture 截图: pixels（物理像素，Retina 2x）
   - CGEvent 点击: points（逻辑坐标）
   - 转换: screen_point = win_origin + pixel_offset / scale_factor
@@ -48,7 +48,6 @@ import sys
 import ctypes
 import logging
 import argparse
-from datetime import datetime
 from collections import deque
 try:
     from PIL import Image, ImageDraw
@@ -896,6 +895,8 @@ def run_checkin(debug=False, dry_run=False):
                         logging.info("未找到弹窗按钮，可能已直接签到")
             else:
                 logging.info("点击后窗口无变化，可能未命中按钮")
+        else:
+            logging.info("Dry run 模式，不执行点击")
         return True
 
     # 7. 查找"今日已领"灰色按钮
@@ -1090,7 +1091,7 @@ def run_checkin(debug=False, dry_run=False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="WorkBuddy macOS 签到脚本 (v3 截屏分析模式)"
+        description="WorkBuddy macOS 签到脚本 (v3.2 截屏分析模式)"
     )
     parser.add_argument(
         '--debug', action='store_true',
