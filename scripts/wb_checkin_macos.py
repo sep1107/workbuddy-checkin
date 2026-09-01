@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WorkBuddy 每日签到自动领取积分脚本 (macOS 版 v3.2)
+WorkBuddy 每日签到自动领取积分脚本 (macOS 版 v3.4)
 ================================================
 v3 完全重写：抛弃辅助功能树方案（Electron 不暴露 DOM），
 改用截屏分析 + CGEvent 鼠标模拟。
@@ -18,6 +18,27 @@ v3.2 改进（2026-08-17）：
   - find_bright_button 支持 win_rect 参数，限制搜索范围到 WorkBuddy 窗口内
     防止点击到其他应用窗口（06:03 误点击 (1092,624) 切换到 Chrome 的教训）
   - 主流程弹窗按钮搜索也限制到窗口范围内
+v3.3 改进（2026-09-01）：
+  - 头像坐标改右上角：v5.3.x 用户徽章移到 (0.91, 0.04)。
+    旧左下角 (0.08, 0.95) 在新版 UI 下点中"新版本就绪/重启升级"横幅，
+    从未真正点开头像；之前几天的"成功"也是巧合路径。
+  - 移除"亮色按钮质心"盲点回退：所有检测器落空时点击全窗口亮像素质心
+    等于随机点击（09-01 两次失败点了 (348,768)/(516,807)），可能误触发
+    任意 UI。改为明确 abort + return False，等待 --debug 校准。
+  - 配合 wb_checkin.sh wrapper 隔离解释器依赖，托管 Python 被重置也不影响。
+v3.4 改进（2026-09-02）：
+  - 【关键修复】主流程改为「先验证再弹窗」：v5.4.x UI 点击「立即领取」后
+    **直接领取、无确认弹窗**，唯一可靠信号是按钮变灰成「今日已领」。
+    旧逻辑只看窗口差异 > 1% 就去 find_bright_button 找"弹窗按钮"，
+    而 ensure_running/activate_app 的 2%+ 全局差异会触发假阳性，
+    导致在主界面点错位置（2026-09-02 07:13 报"完成"但实际未签到；
+    07:17 实际签到成功却报"无变化"——日志完全失真）。
+  - 点击「立即领取」后优先用 find_claimed_button 验证「今日已领」，
+    命中即报成功并返回；只有确实未直接领取（可能弹出确认框）
+    才走 find_bright_button 弹窗分支。
+  - 弹窗分支点击后同样再次验证；未检测到「今日已领」则报 WARNING
+    并 return False，不再盲信"签到流程完成"。
+  - 回退流程（头像→菜单→深色按钮）同样套用「先验证再弹窗」。
 
 技术方案:
   1. CGWindowListCopyWindowInfo 获取窗口位置（points 坐标系，无需自动化权限）
@@ -79,11 +100,13 @@ DIALOG_SEARCH = (0.20, 0.80, 0.30, 0.85)
 # 截图差异判定（窗口区域内，1% 以上视为有变化）
 DIFF_THRESHOLD = 0.01
 
-# v3.2: 点击头像后弹出下拉菜单，需要点击"Buddy 加油站"条目
-# 才能打开签到卡片。菜单从头像向上展开，"Buddy 加油站"是第3个条目
-# 相对窗口位置 (x_ratio, y_ratio)
-# 2026-08-17 实测: 文本中心在窗口 x≈110, y≈278 points
-MENU_BUDDY_RATIO = (0.11, 0.37)
+# v3.3: 头像在窗口右上角（v5.3.x UI 用户徽章 "阿七" 位置）。
+#       旧版本在左下角，已废弃——左下角现在是"新版本就绪/重启升级"横幅。
+AVATAR_RATIO = (0.91, 0.04)
+# v3.3: 点击头像后下拉菜单向下展开。"Buddy 加油站"是首项，
+#       x 取头像左侧的菜单宽度内 (~0.82)，y 在头像下方 (~0.10)。
+#       2026-09-01 初步估计（待 --debug 校准为精确坐标）。
+MENU_BUDDY_RATIO = (0.82, 0.10)
 
 # ==================== CGEvent 鼠标模拟 ====================
 
@@ -823,9 +846,15 @@ def save_debug(img, name, debug, overlay=None):
 
 
 def run_checkin(debug=False, dry_run=False):
-    """执行签到流程。返回 True 表示流程完成。"""
+    """执行签到流程。
+
+    v3.4 返回语义变更：
+      True  = 已**验证**签到成功（检测到「今日已领」）或今日已签到，
+              或处于 dry-run 模式。
+      False = 未能在界面上验证到签到结果（此前版本会盲报 True）。
+    """
     logging.info("=" * 50)
-    logging.info("WorkBuddy 每日签到开始 (v3.2 截屏分析模式)")
+    logging.info("WorkBuddy 每日签到开始 (v3.4 截屏分析模式)")
 
     if debug:
         os.makedirs(DEBUG_DIR, exist_ok=True)
@@ -874,6 +903,29 @@ def run_checkin(debug=False, dry_run=False):
             after_img = screenshot()
             save_debug(after_img, "03_after_click.png", debug)
             after_win = crop_window(after_img, rect, scale)
+
+            # v3.4: v5.4.x UI 点击「立即领取」后**直接领取，无确认弹窗**，
+            #       唯一可靠信号是按钮变灰成「今日已领」。
+            #       旧逻辑只看窗口差异 > 1% 就去 find_bright_button，
+            #       而 ensure_running/activate_app 的 2%+ 全局差异会触发
+            #       假阳性，导致在主界面点错位置
+            #       （2026-09-02 07:13 实际未签到却报"完成"）。
+            #       改为「先验证再弹窗」。
+            claimed_now = find_claimed_button(after_win)
+            if claimed_now:
+                logging.info(
+                    "验证: 检测到'今日已领'状态，签到成功（直接领取，无弹窗）"
+                )
+                if debug:
+                    save_debug(
+                        after_win.copy(), "03_after_click_claimed.png", debug,
+                        overlay=[
+                            {'kind': 'rect', 'bbox': claimed_now, 'color': 'green'}
+                        ],
+                    )
+                return True
+
+            # 未直接领取成功 → 可能弹出了确认弹窗（旧版 UI 或 A/B 分流）
             if images_different(win_img, after_win, threshold=DIFF_THRESHOLD):
                 logging.info("检测到窗口变化，查找弹窗按钮...")
                 btn = find_bright_button(after_img, win_rect=rect, scale=scale)
@@ -885,16 +937,26 @@ def run_checkin(debug=False, dry_run=False):
                     time.sleep(2)
                     final = screenshot()
                     save_debug(final, "04_final.png", debug)
-                    logging.info("签到流程完成")
-                else:
-                    logging.info("未找到弹窗按钮，检查是否已直接签到...")
-                    final_win = crop_window(after_img, rect, scale)
+                    # v3.4: 点击弹窗后再次验证，不再盲信"完成"
+                    final_win = crop_window(final, rect, scale)
                     if find_claimed_button(final_win):
                         logging.info("验证: 检测到'今日已领'状态，签到成功")
                     else:
-                        logging.info("未找到弹窗按钮，可能已直接签到")
+                        logging.warning(
+                            "点击弹窗按钮后未检测到'今日已领'，签到结果存疑"
+                            "（建议 --debug 检查 04_final.png）"
+                        )
+                        return False
+                else:
+                    logging.warning(
+                        "未找到弹窗按钮，且未检测到'今日已领'，签到结果存疑"
+                    )
+                    return False
             else:
-                logging.info("点击后窗口无变化，可能未命中按钮")
+                logging.warning(
+                    "点击后窗口无变化，且未检测到'今日已领'，可能未命中按钮"
+                )
+                return False
         else:
             logging.info("Dry run 模式，不执行点击")
         return True
@@ -976,8 +1038,8 @@ def run_checkin(debug=False, dry_run=False):
 
     # 9. 回退流程: 未检测到任何已知按钮/卡片，尝试点击头像→菜单→签到卡片
     logging.info("未找到签到卡片，可能卡片不可见；回退点击头像区域")
-    avatar_x = win_x + win_w * 0.08
-    avatar_y = win_y + win_h * 0.95
+    avatar_x = win_x + win_w * AVATAR_RATIO[0]
+    avatar_y = win_y + win_h * AVATAR_RATIO[1]
     logging.info(f"回退策略: 点击头像区域 ({avatar_x:.0f}, {avatar_y:.0f})")
     if not dry_run:
         cg_click(avatar_x, avatar_y)
@@ -1009,6 +1071,24 @@ def run_checkin(debug=False, dry_run=False):
             time.sleep(2.5)
             after_card = screenshot()
             save_debug(after_card, "04_after_card.png", debug)
+
+            # v3.4: 同样「先验证再弹窗」
+            after_card_win = crop_window(after_card, rect, scale)
+            claimed2 = find_claimed_button(after_card_win)
+            if claimed2:
+                logging.info(
+                    "验证: 检测到'今日已领'状态，签到成功"
+                    "（回退: 头像→菜单→深色按钮，直接领取）"
+                )
+                if debug:
+                    save_debug(
+                        after_card_win.copy(), "04_after_card_claimed.png", debug,
+                        overlay=[
+                            {'kind': 'rect', 'bbox': claimed2, 'color': 'green'}
+                        ],
+                    )
+                return True
+
             btn = find_bright_button(after_card, win_rect=rect, scale=scale)
             if btn:
                 bx = btn[0] / scale
@@ -1016,10 +1096,22 @@ def run_checkin(debug=False, dry_run=False):
                 logging.info(f"找到弹窗按钮，点击 ({bx:.0f}, {by:.0f})")
                 cg_click(bx, by)
                 time.sleep(2)
-                logging.info("签到流程完成（回退: 头像→菜单→深色按钮→弹窗）")
-            else:
-                logging.info("未找到弹窗按钮，可能已直接签到")
-            return True
+                final = screenshot()
+                save_debug(final, "05_final.png", debug)
+                final_win = crop_window(final, rect, scale)
+                if find_claimed_button(final_win):
+                    logging.info(
+                        "验证: 检测到'今日已领'状态，签到成功"
+                        "（回退: 头像→菜单→深色按钮→弹窗）"
+                    )
+                    return True
+                logging.warning(
+                    "回退流程点击弹窗后未检测到'今日已领'，签到结果存疑"
+                    "（建议 --debug 检查 05_final.png）"
+                )
+                return False
+            logging.warning("未找到弹窗按钮，且未检测到'今日已领'，签到结果存疑")
+            return False
 
         # 检查是否已签到（v3.2: 卡片可能是"今日已领"状态）
         claimed = find_claimed_button(after_win)
@@ -1071,19 +1163,14 @@ def run_checkin(debug=False, dry_run=False):
                     logging.info("未找到弹窗按钮，可能已直接签到")
         else:
             logging.info("点击菜单后仍未找到签到卡片")
-            # 最后尝试: 在窗口范围内搜索亮色按钮
-            btn = find_bright_button(after_menu, win_rect=rect, scale=scale)
-            if btn:
-                bx = btn[0] / scale
-                by = btn[1] / scale
-                logging.info(f"窗口内找到亮色按钮，点击 ({bx:.0f}, {by:.0f})")
-                cg_click(bx, by)
-                time.sleep(2)
-                final = screenshot()
-                save_debug(final, "04_final.png", debug)
-                logging.info("回退流程完成（窗口内亮色按钮）")
-            else:
-                logging.info("回退流程完成，未找到可点击目标")
+            # v3.3 安全中止：所有检测器落空。
+            # 历史上此分支会点击全窗口亮像素"质心"，本质是随机坐标盲点
+            # (09-01 05:00 点 (348,768)、05:30 点 (516,807))，可能误触
+            # 任意 UI（曾差点点到"重启升级"按钮）。改为返回失败。
+            logging.error("头像+菜单后仍未找到签到入口；安全中止")
+            logging.error("请用 --debug 排查: python3 /Users/sep/.workbuddy/scripts/wb_checkin.py --debug")
+            logging.error("调试截图保存到: /tmp/wb_checkin_debug/")
+            return False
     else:
         logging.info("Dry run 模式，不执行回退点击")
     return True
@@ -1091,7 +1178,7 @@ def run_checkin(debug=False, dry_run=False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="WorkBuddy macOS 签到脚本 (v3.2 截屏分析模式)"
+        description="WorkBuddy macOS 签到脚本 (v3.4 截屏分析模式)"
     )
     parser.add_argument(
         '--debug', action='store_true',

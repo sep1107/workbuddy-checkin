@@ -44,11 +44,20 @@ python3 scripts/wb_checkin.py --dry-run
 
 WorkBuddy 是 Electron 应用，macOS 的 System Events 无法暴露其内部 DOM 元素（`entire contents` 和 BFS `UI elements of` 均失败）。v3 完全抛弃辅助功能树方案，改用截屏分析 + CGEvent 鼠标模拟：
 
-1. System Events 获取窗口位置（points 坐标）
+1. `CGWindowListCopyWindowInfo` 获取窗口位置（points 坐标，无需辅助功能权限）
 2. `screencapture` 截屏（物理像素）
-3. Pillow 图像分析：在左下角搜索深色"Buddy加油站"卡片（BFS 连通区域分析）
-4. CGEvent 模拟点击卡片"立即领取"按钮（ctypes 调用 CoreGraphics C API）
-5. 截屏对比验证：检测弹窗，如有则继续点击签到按钮
+3. Pillow 图像分析：在左下角搜索「Buddy加油站」卡片（BFS 连通区域分析）
+   - 未签到：深色「立即领取」按钮（`find_dark_button`）
+   - 已签到：灰色「今日已领」按钮（`find_claimed_button`）
+4. CGEvent 模拟点击「立即领取」按钮（ctypes 调用 CoreGraphics C API）
+5. **v3.4 先验证再弹窗**：重新截屏后先用 `find_claimed_button` 检出
+   「今日已领」→ 成功返回；只有没检出（说明可能弹了确认框）才走
+   `find_bright_button` 弹窗分支，且点击后再验证一次
+
+> 注意：v5.4.x 起「立即领取」是**直接领取、无确认弹窗**。旧版（≤ v3.3）
+> 只看窗口像素差异 > 1% 就去找"弹窗按钮"，会被 `ensure_running` /
+> `activate_app` 的 2%+ 全局差异误导，在主界面点错位置——日志报
+> "签到流程完成"但实际未签到。v3.4 只有真的检出「今日已领」才算成功。
 
 ### 坐标体系
 
