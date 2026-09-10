@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WorkBuddy 每日签到自动领取积分脚本 (macOS 版 v3.5)
+WorkBuddy 每日签到自动领取积分脚本 (macOS 版 v3.6)
 ================================================
 v3 完全重写：抛弃辅助功能树方案（Electron 不暴露 DOM），
 改用截屏分析 + CGEvent 鼠标模拟。
@@ -39,6 +39,18 @@ v3.4 改进（2026-09-02）：
   - 弹窗分支点击后同样再次验证；未检测到「今日已领」则报 WARNING
     并 return False，不再盲信"签到流程完成"。
   - 回退流程（头像→菜单→深色按钮）同样套用「先验证再弹窗」。
+v3.6 改进（2026-09-11）：
+  - 【关键修复】find_claimed_button 误报「今日已领」——5.5.x 签到卡片里
+    常驻一个白底灰描边的「认证领积分」按钮，其灰色边框被灰度连通域检测
+    当成"实心灰按钮"，density 仅 ≈0.04 却因 aspect 达标而入选，导致
+    脚本每次都误判"今日已领"直接返回，从不点击「立即领取」（09-11 复盘）。
+  - 修复 1：find_claimed_button 增加**实心度门槛** density >= 0.5。
+    真正的「今日已领」是实心灰填充按钮（density 高），描边按钮被排除。
+  - 修复 2：run_checkin 调换判定权威——**先找深色「立即领取」按钮**。
+    只要它存在就一定是未签到 → 直接点击；仅当它不存在时才认「今日已领」。
+    避免"误报已领"掩盖"实际未领"。
+  - 修复 3：点击后验证改为「'立即领取'按钮已消失」或「检出'今日已领'」，
+    后者为强信号、前者为弱信号（均明确记日志），两者皆无才 WARNING + False。
 
 技术方案:
   1. CGWindowListCopyWindowInfo 获取窗口位置（points 坐标系，无需自动化权限）
@@ -728,6 +740,12 @@ def find_claimed_button(win_img, search=CARD_SEARCH, gray_range=(70, 240)):
             if not (1.5 <= aspect <= 10 or density > 0.8):
                 continue
 
+            # v3.6: 实心度门槛 — 「今日已领」是**实心灰填充**按钮（density 高），
+            #   而卡片里常驻的白底灰描边「认证领积分」按钮 density 仅 ≈0.04，
+            #   必须排除，否则每次都会被误判为"已签到"而跳过点击（09-11 教训）。
+            if density < 0.5:
+                continue
+
             # v3.2: 不再强制要求上方深色背景（新版卡片为浅色），改为综合打分
             dark_above = 0
             band_top = max(0, min_y - 50)
@@ -905,9 +923,10 @@ def is_sidebar_open(win_img):
 def run_checkin(debug=False, dry_run=False):
     """执行签到流程。
 
-    v3.5: WorkBuddy 5.5.x UI — 签到入口移至侧边栏头像菜单。
+    v3.6: WorkBuddy 5.5.x UI — 签到入口移至侧边栏头像菜单。
           流程: 展开侧边栏 → 点击头像 → no-move 点击 "Buddy加油站"
               → 弹出底部签到卡片 → 点击"立即领取" → 验证"今日已领"。
+          判定权威：深色「立即领取」按钮存在 ⇔ 未签到（优先点击）。
 
     返回语义（v3.4 起）：
       True  = 已**验证**签到成功（检测到「今日已领」）或今日已签到，
@@ -915,7 +934,7 @@ def run_checkin(debug=False, dry_run=False):
       False = 未能在界面上验证到签到结果（此前版本会盲报 True）。
     """
     logging.info("=" * 50)
-    logging.info("WorkBuddy 每日签到开始 (v3.5 — 5.5.x 侧边栏导航)")
+    logging.info("WorkBuddy 每日签到开始 (v3.6 — 5.5.x 侧边栏导航)")
 
     if debug:
         os.makedirs(DEBUG_DIR, exist_ok=True)
@@ -982,17 +1001,23 @@ def run_checkin(debug=False, dry_run=False):
     after_win = crop_window(after_nav, rect, scale)
     save_debug(after_win, "03_after_nav_window.png", debug)
 
-    # 9. v3.4 先验证原则: 已是"今日已领"？
-    claimed = find_claimed_button(after_win)
-    if claimed:
-        logging.info("已是'今日已领'状态，今日已签到，无需操作")
-        if debug:
-            save_debug(after_win.copy(), "03_claimed.png", debug,
-                       overlay=[{'kind': 'rect', 'bbox': claimed, 'color': 'green'}])
-        return True
-
-    # 10. 查找"立即领取"深色按钮并点击
+    # 9. v3.6 判定权威：**先找深色「立即领取」按钮**。
+    #    只要它存在 → 一定是未签到（按钮尚未变灰）→ 必须点击。
+    #    绝不能被 find_claimed_button 的误报掩盖（09-11 教训：卡片常驻的
+    #    白底描边「认证领积分」按钮曾被误判成"今日已领"，导致从不点击）。
     dark_btn = find_dark_button(after_win)
+
+    # 仅当深色按钮不存在时，才考虑"今日已领"状态
+    if dark_btn is None:
+        claimed = find_claimed_button(after_win)
+        if claimed:
+            logging.info("已是'今日已领'状态，今日已签到，无需操作")
+            if debug:
+                save_debug(after_win.copy(), "03_claimed.png", debug,
+                           overlay=[{'kind': 'rect', 'bbox': claimed, 'color': 'green'}])
+            return True
+
+    # 10. 存在"立即领取"深色按钮 → 点击领取
     if dark_btn:
         l, t, r, b = dark_btn
         w_btn = r - l
@@ -1011,10 +1036,16 @@ def run_checkin(debug=False, dry_run=False):
         final = screenshot()
         save_debug(final, "04_final.png", debug)
         final_win = crop_window(final, rect, scale)
-        if find_claimed_button(final_win):
+        # v3.6 验证：强信号 = 检出"今日已领"；弱信号 = 深色"立即领取"按钮已消失
+        claimed_after = find_claimed_button(final_win)
+        dark_after = find_dark_button(final_win)
+        if claimed_after:
             logging.info("验证: 检测到'今日已领'，签到成功")
             return True
-        logging.warning("点击'立即领取'后未检出'今日已领'，签到结果存疑")
+        if dark_after is None:
+            logging.info("验证: '立即领取'按钮已消失（弱信号），判定签到成功")
+            return True
+        logging.warning("点击'立即领取'后按钮仍在且未检出'今日已领'，签到结果存疑")
         return False
 
     # 11. 回退: 旧版深色卡片
@@ -1048,7 +1079,7 @@ def run_checkin(debug=False, dry_run=False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="WorkBuddy macOS 签到脚本 (v3.5 侧边栏导航)"
+        description="WorkBuddy macOS 签到脚本 (v3.6 侧边栏导航)"
     )
     parser.add_argument(
         '--debug', action='store_true',
