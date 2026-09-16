@@ -38,7 +38,7 @@ python3 scripts/wb_checkin.py --dry-run
 
 ---
 
-## macOS 实现 (v3.6)
+## macOS 实现 (v3.7)
 
 ### 技术方案
 
@@ -58,7 +58,7 @@ WorkBuddy 是 Electron 应用，macOS 的 System Events 无法暴露其内部 DO
 展开侧边栏（若隐藏）→ 点击左下角头像 "阿七." → 头像菜单首项区域 "Buddy加油站" → 弹出底部签到卡片
 ```
 
-- 侧边栏开关 `SIDEBAR_TOGGLE_RATIO=(0.075,0.034)`；头像 `AVATAR_RATIO=(0.041,0.950)`；菜单项 `MENU_BUDDY_RATIO=(0.088,0.339)`。
+- 侧边栏开关 `SIDEBAR_TOGGLE_RATIO=(0.075,0.034)`；头像 `AVATAR_RATIO=(0.041,0.950)`；菜单项 `MENU_BUDDY_RATIO=(0.088,0.385)`（**v3.7**：5.5.6 菜单重构后由 0.339 下移，旧值会点中"积分余额"打开设置面板，签到卡片不出现）。
 - ⚠️ **点"Buddy加油站"必须用 `cg_click_nomove()`**：Electron 头像下拉菜单是"锚定型"，`cg_click` 会先把光标移离头像 → 菜单立即关闭 → 点击落到下层侧边栏项（曾误触"定时任务"页）。点"立即领取"按钮仍用普通 `cg_click`。
 - `is_sidebar_open()` 通过采样头像绿色外环判定侧边栏是否展开（避免重复点开关反而关掉）。
 
