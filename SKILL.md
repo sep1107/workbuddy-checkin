@@ -121,6 +121,25 @@ pip3 install Pillow
 再用 Pillow 把命中框画出来（红=深色按钮、绿=已领判定、蓝=搜索区），
 即可直观看清检测落到了哪个 UI 元素上。
 
+**坐标漂移校准手册（WorkBuddy 更新界面后连续失败时用）**：
+症状 = 日志报"导航后仍未找到签到入口"，但 `03_after_nav_window.png` 里出现的
+是**设置面板**或其他页面而非底部签到卡片 → 说明菜单项 `MENU_BUDDY_RATIO` 已漂移。
+校准步骤（2026-09-16 实修验证）：
+1. 写探针：`import wb_checkin_macos as wb`（`sys.path` 指向脚本目录），
+   调 `wb.ensure_running()` / `wb.activate_app()` / `wb.get_window_rect()`，
+   然后 `wb.cg_click(头像坐标)` + `time.sleep(2)` + `wb.screenshot().save(...)`。
+   探针**只截图、不点菜单项**，安全。
+2. 从截图量出新"Buddy加油站"的 y 像素 → 换算 `ratio = (y_screen - win_y) / win_h`，
+   取文字行中心（图像若被缩放显示，注意乘回缩放比）。
+3. 改 `MENU_BUDDY_RATIO` 的 y 分量后，先跑一次 `--debug` 确认
+   `03_after_nav_window.png` 出现签到卡片（白底 + 黑色「立即领取」），再正式跑。
+4. Esc 键可用 `CGEventCreateKeyboardEvent(None, 53, down/up)` + `CGEventPost` 发送，
+   用来关闭误开的设置面板恢复原状。
+
+> 检测逻辑与窗口坐标无关的部分（`find_dark_button` 等）通常**不用改**：
+> 5.5.6 的新卡片仍是窗口左下角弹出、黑色实心「立即领取」按钮，
+> 仍落在 `CARD_SEARCH = (0.02, 0.35, 0.72, 0.95)` 内。
+
 ### 配置参数
 
 macOS 脚本顶部可调参数：
@@ -135,7 +154,7 @@ macOS 脚本顶部可调参数：
 | `DIFF_THRESHOLD` | `0.01` | 截图差异阈值（1%） |
 | `SIDEBAR_TOGGLE_RATIO` | `(0.075, 0.034)` | v3.5 侧边栏展开开关 |
 | `AVATAR_RATIO` | `(0.041, 0.950)` | v3.5 侧边栏左下头像 |
-| `MENU_BUDDY_RATIO` | `(0.088, 0.339)` | v3.5 头像菜单中"Buddy加油站"项 |
+| `MENU_BUDDY_RATIO` | `(0.088, 0.385)` | 头像菜单中"Buddy加油站"项（**v3.7 更新**；5.5.6 前为 0.339） |
 | `find_claimed_button` 实心度门槛 | `density >= 0.5` | v3.6 排除描边按钮误报 |
 
 ---
