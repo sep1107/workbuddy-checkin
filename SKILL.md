@@ -140,103 +140,38 @@ macOS 脚本顶部可调参数：
 
 ---
 
-## Windows 实现
+## Windows 新版（2026-09-16）
 
-### 技术方案
+Windows 使用 `comtypes` 直连 UIAutomationCore，以 `fuel-expanded-claim` 控件 ID 和精确文案判断签到；不需要设置昵称，也不再修改系统屏幕阅读器标志。带 DPI 感知、最小化窗口恢复、菜单重试、锁屏跳过、应用拉起和结果日志。
 
-Windows 版通过 `uiautomation` 库访问 Windows UI Automation 辅助功能树：
+### 安装与执行
 
-1. 确保 WorkBuddy 客户端运行（未运行则拉起）
-2. 临时开启系统"屏幕阅读器"标志（`SPI_SETSCREENREADER`），激活 Electron/Chromium accessibility 树
-3. 在左下角找到用户头像并点击，打开个人中心菜单
-4. 点击"签到领积分"打开签到面板
-5. 判断状态：今日已领 → 跳过；立即领取 → 点击领取并确认
-6. 恢复屏幕阅读器标志，记录日志
+在 Windows 上将仓库放入长期保留的目录，确保 WorkBuddy 已安装并登录。先安装可在命令行运行的 Python 3.9+，然后：
 
-### 前置条件
+1. 双击 `windows/1_setup_env.cmd`，创建隔离环境并安装 `comtypes`、`pillow`。
+2. 双击 `windows/3_run_checkin_now.cmd`，执行并核对结果。运行期间不要操作鼠标。
+3. 双击 `windows/2_register_daily_task.cmd`，注册每天 09:00 的 `WorkBuddyDailyCheckin`；可传入 `08:30` 等时间。
 
-**uiautomation 库（必须）**：
+在仓库根目录的 Windows cmd 中，也可使用统一入口：
+
 ```cmd
-pip install uiautomation
+"%USERPROFILE%\.workbuddy\binaries\python\envs\default\Scripts\python.exe" scripts\wb_checkin.py --json
+"%USERPROFILE%\.workbuddy\binaries\python\envs\default\Scripts\python.exe" scripts\wb_checkin.py --dry-run --json
 ```
 
-**WorkBuddy 安装路径**：默认 `C:\Program Files\WorkBuddy\WorkBuddy.exe`，如不同需修改脚本中的 `WORKBUDDY_EXE`。
+`--dry` / `--dry-run` 会导航菜单、读取状态，但不点击领取；`--exe` 可指定 WorkBuddy.exe 路径。默认路径为 `C:\Program Files\WorkBuddy\WorkBuddy.exe`。
 
-**用户昵称配置**：修改脚本中的 `USER_ITEM_KEYWORDS`（默认 `["你的昵称"]`）为实际 WorkBuddy 显示名。
+计划任务使用当前用户的交互会话，无需存密码；锁屏时跳过，解锁后需手动运行或由兜底任务重试。`StartWhenAvailable` 支持错过计划时间后补跑，但不保证解锁时自动重试。`IgnoreNew` 仅防止同一个计划任务重复启动，手动执行和 WorkBuddy 兜底应错开时间。
 
-### 配置参数
+日志位于 `windows/workbuddy-desktop-checkin/logs/`：当日 `result-YYYY-MM-DD.json`、最近一次 `last_result.json` 和月度文本日志。只有 `success` / `already_claimed` 算完成；`dry_ok` 只表示试运行通过。退出码：0 成功/已签/试运行通过，2 需人工介入，3 异常，4 跳过。
 
-Windows 脚本顶部可调参数：
+便携部署、可选 Skill 安装、兜底提示词与诊断方法见 [Windows 使用说明](windows/README.md)。
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `WORKBUDDY_EXE` | `C:\Program Files\WorkBuddy\WorkBuddy.exe` | WorkBuddy 安装路径 |
-| `USER_ITEM_KEYWORDS` | `["你的昵称"]` | 左下角头像/昵称关键词 |
-| `CHECKIN_ENTRY_KEYWORDS` | `["签到领积分"]` | 签到入口按钮文字 |
-| `CLAIMED_KEYWORDS` | `["今日已领", "已领"]` | 已签到状态按钮 |
-| `CLAIM_KEYWORDS` | `["立即领取", "领取", "领"]` | 未签到时的领取按钮 |
+## 自动化调度与诊断
 
----
-
-## 两平台方案对比
-
-| 项目 | macOS (v3.6) | Windows |
-|------|-----------|---------|
-| UI 自动化方案 | 截屏分析 + CGEvent 鼠标模拟 | uiautomation 辅助功能树 |
-| 按钮定位 | 颜色+形状+位置图像分析 | 按 `Name` 属性匹配控件 |
-| 鼠标点击 | ctypes → CoreGraphics CGEvent | `ctypes.windll.user32` |
-| 截图验证 | Pillow 截图对比 | 读取控件属性变化 |
-| 屏幕阅读器标志 | 不需要 | 需临时开启 `SPI_SETSCREENREADER` |
-| 第三方依赖 | Pillow | uiautomation |
-| 调试模式 | `--debug` 保存截图 | 无（日志输出） |
-| 进程名 | "WorkBuddy" / "Electron" 双名称 | "WorkBuddy.exe" |
-
----
-
-## 自动化调度
-
-### WorkBuddy 自动化任务（推荐）
-
-统一入口，两个平台用同一条命令：
-
-> 执行 WorkBuddy 签到脚本：运行命令 `python3 ~/.workbuddy/scripts/wb_checkin.py`，报告签到结果。
-
-### macOS launchd
-
-创建 `~/Library/LaunchAgents/com.workbuddy.checkin.plist`，详见 `references/wb_checkin_说明.md`。
-
-### Windows 计划任务
-
-通过 `schtasks` 或任务计划程序设置每日定时运行，详见 `references/wb_checkin_说明.md`。
-
----
-
-## 故障排查
-
-### macOS
-
-| 症状 | 原因 | 修复 |
-|------|------|------|
-| "错误: 需要 Pillow 库" | Pillow 未安装 | `pip3 install Pillow` |
-| 截图空白 | 屏幕录制权限未授予 | 系统设置 → 隐私与安全性 → 屏幕录制 |
-| "无法获取窗口位置" | 辅助功能权限不足或 WorkBuddy 未运行 | 检查辅助功能列表；确保 WorkBuddy 已登录 |
-| "未找到深色可点击按钮" | 卡片不可见或界面改版 | `--debug` 查看 `03_after_nav_window.png`；核对 `SIDEBAR_TOGGLE_RATIO`/`AVATAR_RATIO`/`MENU_BUDDY_RATIO` |
-| **误报"已是今日已领"但实际未签到** | `find_claimed_button` 把卡片常驻的描边按钮（如"认证领积分"）当成实心灰按钮 | v3.6 已修：加 `density>=0.5` + "深色按钮优先"判定。若复现，按 `--debug` 截图排查命中框 |
-| 点击无反应 | 缩放因子错误或卡片偏移 | `--debug` 查看 `04_final.png`；检查日志中的 scale 值 |
-| 头像菜单点不开/误触侧边栏项 | 用了 `cg_click` 而非 `cg_click_nomove` | 点"Buddy加油站"必须 `cg_click_nomove`（光标离开锚点菜单即关） |
-
-### Windows
-
-| 症状 | 原因 | 修复 |
-|------|------|------|
-| "未找到用户头像入口" | accessibility 树未初始化或昵称不匹配 | 脚本会自动重试 4 次；检查 `USER_ITEM_KEYWORDS` 是否匹配 |
-| "未找到签到/领取按钮" | 界面改版或签到面板未打开 | 检查 `CHECKIN_ENTRY_KEYWORDS` 等关键词是否匹配 |
-| 启动失败 | WorkBuddy 安装路径不正确 | 修改 `WORKBUDDY_EXE` 为实际路径 |
-| accessibility 树为空 | 屏幕阅读器标志未生效 | 确保脚本以管理员权限运行；检查 `SPI_SETSCREENREADER` 调用 |
-
-## Resources
-
-- `scripts/wb_checkin.py` — 跨平台入口脚本（自动选择平台）
-- `scripts/wb_checkin_macos.py` — macOS 实现（截屏分析 + CGEvent，需 Pillow）
-- `scripts/wb_checkin_windows.py` — Windows 实现（uiautomation，需 uiautomation 库）
-- `README.md` — 面向公众的快速开始、权限设置、定时任务模板和故障排查
+- macOS 保留现有 launchd / WorkBuddy 调度，快速配置见 `README.md`。
+- Windows 以 `windows/workbuddy-desktop-checkin/scripts/run_checkin.py` 为统一日志入口。
+- Windows 兜底先读取同一部署目录的当日结果；未完成时调用 `run_checkin.py --json`，避免漏写结果。
+- Windows UI 改版时用 `dump_uia.py` 导出控件树；只按当前可见控件操作，不猜坐标。
+- `fuel-action` 是认证入口，不能当签到按钮点击。
+- Windows 详细说明与界面地图见 `windows/README.md` 和 `windows/workbuddy-desktop-checkin/references/ui-map.md`。

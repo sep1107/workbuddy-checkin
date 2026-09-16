@@ -5,12 +5,12 @@ WorkBuddy 每日签到 - 跨平台入口
 ================================
 根据操作系统自动选择对应平台脚本执行：
   - macOS  → wb_checkin_macos.py   (截屏分析 + CGEvent 鼠标模拟)
-  - Windows → wb_checkin_windows.py (uiautomation 辅助功能树)
+  - Windows → wb_checkin_windows.py (comtypes UIA + 日志执行器)
 
 用法:
   python3 wb_checkin.py             # 正式签到
   python3 wb_checkin.py --debug     # 调试模式（macOS 保存截图）
-  python3 wb_checkin.py --dry-run   # 只检测不点击（仅 macOS）
+  python3 wb_checkin.py --dry-run   # 只检测不领取（Windows 会导航界面）
 
 所有命令行参数原样传递给平台脚本。
 """

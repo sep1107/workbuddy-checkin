@@ -7,41 +7,7 @@
 WorkBuddy 是 Electron 应用，不同操作系统下 UI 自动化方案不同：
 
 - **macOS**：Electron 不暴露辅助功能树给 System Events，因此采用**截屏分析 + CGEvent 鼠标模拟**——用 `screencapture` 截图，Pillow 图像分析定位"Buddy加油站"深色卡片，通过 CoreGraphics C API 模拟点击，再用截图对比验证签到结果。
-- **Windows**：通过 `uiautomation` 库访问 UI Automation 辅助功能树，临时开启系统屏幕阅读器标志激活 Electron accessibility 树，按控件名称定位头像和签到按钮。
-
-统一入口脚本 `wb_checkin.py` 通过 `sys.platform` 自动选择平台实现，无需手动区分。
-
-## 快速开始
-
-### 1. 克隆仓库
-
-```bash
-git clone https://github.com/sep1107/workbuddy-checkin.git
-cd workbuddy-checkin/scripts
-```
-
-### 2. 安装依赖
-
-**macOS**：
-```bash
-pip3 install Pillow
-```
-
-**Windows**：
-```cmd
-pip install uiautomation
-```
-
-### 3. 配置（仅 Windows）
-
-打开 `scripts/wb_checkin_windows.py`，修改以下配置：
-
-```python
-WORKBUDDY_EXE = r"C:\Program Files\WorkBuddy\WorkBuddy.exe"  # ← 改成你的安装路径
-USER_ITEM_KEYWORDS = ["你的昵称"]  # ← 改成你在 WorkBuddy 里显示的昵称
-```
-
-macOS 无需配置，开箱即用。
+- **Windows**：见下方 Windows 新版安装流程。
 
 ### 4. 运行
 
@@ -56,7 +22,7 @@ python3 scripts/wb_checkin.py --debug
 python3 scripts/wb_checkin.py --dry-run
 ```
 
-日志输出到 `~/.workbuddy/scripts/checkin.log`。
+macOS 日志输出到 `~/.workbuddy/scripts/checkin.log`；Windows 日志位置见下文。
 
 ## 权限设置
 
@@ -71,8 +37,7 @@ python3 scripts/wb_checkin.py --dry-run
 
 ### Windows
 
-- 以管理员权限运行脚本（`SPI_SETSCREENREADER` 需要管理员权限）
-- 确保 WorkBuddy 客户端已登录
+- 在已登录且未锁屏的交互会话中运行；确保 WorkBuddy 客户端已登录。
 
 ## 定时任务
 
@@ -105,22 +70,41 @@ EOF
 launchctl load ~/Library/LaunchAgents/com.workbuddy.checkin.plist
 ```
 
-### Windows（计划任务）
+## Windows 新版（2026-09-16）
+
+Windows 使用 `comtypes` 直连 UIAutomationCore，以 `fuel-expanded-claim` 控件 ID 和精确文案判断签到；不需要设置昵称，也不再修改系统屏幕阅读器标志。带 DPI 感知、最小化窗口恢复、菜单重试、锁屏跳过、应用拉起和结果日志。
+
+### 安装与执行
+
+在 Windows 上将仓库放入长期保留的目录，确保 WorkBuddy 已安装并登录。先安装可在命令行运行的 Python 3.9+，然后：
+
+1. 双击 `windows/1_setup_env.cmd`，创建隔离环境并安装 `comtypes`、`pillow`。
+2. 双击 `windows/3_run_checkin_now.cmd`，执行并核对结果。运行期间不要操作鼠标。
+3. 双击 `windows/2_register_daily_task.cmd`，注册每天 09:00 的 `WorkBuddyDailyCheckin`；可传入 `08:30` 等时间。
+
+在仓库根目录的 Windows cmd 中，也可使用统一入口：
 
 ```cmd
-schtasks /create /tn "WorkBuddy签到" /tr "python %USERPROFILE%\.workbuddy\scripts\wb_checkin.py" /sc daily /st 09:00 /f
+"%USERPROFILE%\.workbuddy\binaries\python\envs\default\Scripts\python.exe" scripts\wb_checkin.py --json
+"%USERPROFILE%\.workbuddy\binaries\python\envs\default\Scripts\python.exe" scripts\wb_checkin.py --dry-run --json
 ```
+
+`--dry` / `--dry-run` 会导航菜单、读取状态，但不点击领取；`--exe` 可指定 WorkBuddy.exe 路径。默认路径为 `C:\Program Files\WorkBuddy\WorkBuddy.exe`。
+
+计划任务使用当前用户的交互会话，无需存密码；锁屏时跳过，解锁后需手动运行或由兜底任务重试。`StartWhenAvailable` 支持错过计划时间后补跑，但不保证解锁时自动重试。`IgnoreNew` 仅防止同一个计划任务重复启动，手动执行和 WorkBuddy 兜底应错开时间。
+
+日志位于 `windows/workbuddy-desktop-checkin/logs/`：当日 `result-YYYY-MM-DD.json`、最近一次 `last_result.json` 和月度文本日志。只有 `success` / `already_claimed` 算完成；`dry_ok` 只表示试运行通过。退出码：0 成功/已签/试运行通过，2 需人工介入，3 异常，4 跳过。
+
+便携部署、可选 Skill 安装、兜底提示词与诊断方法见 [Windows 使用说明](windows/README.md)。
 
 ## 文件结构
 
-```
-scripts/
-  wb_checkin.py            ← 跨平台入口（自动选择平台脚本）
-  wb_checkin_macos.py      ← macOS 实现（截屏分析 + CGEvent）
-  wb_checkin_windows.py    ← Windows 实现（uiautomation 辅助功能树）
-references/
-  wb_checkin_说明.md        ← 详细设置、配置、故障排查指南
-```
+- `scripts/wb_checkin.py`：跨平台入口。
+- `scripts/wb_checkin_macos.py`：macOS 实现。
+- `scripts/wb_checkin_windows.py`：Windows 兼容入口，转交新版日志执行器。
+- `windows/`：可独立复制的 Windows 便携包、五个 CMD 入口及使用说明。
+- `windows/workbuddy-desktop-checkin/`：Windows Skill、六个 Python 模块和 UI 地图。
+- `tests/test_windows.py`：无需 Windows 桌面的回归测试。
 
 ## 技术细节
 
@@ -192,17 +176,18 @@ v3.4 起只有**在界面上真的检出「今日已领」**才算成功。
 
 | 项目 | macOS | Windows |
 |------|-------|---------|
-| UI 自动化 | 截屏分析 + CGEvent | uiautomation 辅助功能树 |
-| 按钮定位 | 颜色+形状+位置图像分析 | 按 Name 属性匹配控件 |
+| UI 自动化 | 截屏分析 + CGEvent | comtypes UIAutomationCore |
+| 按钮定位 | 颜色+形状+位置图像分析 | 控件 ID + 精确文案 + 区域过滤 |
 | 鼠标点击 | ctypes → CoreGraphics CGEvent | ctypes.windll.user32 |
 | 截图验证 | Pillow 截图对比 | 读取控件属性变化 |
-| 屏幕阅读器标志 | 不需要 | 需临时开启 SPI_SETSCREENREADER |
-| 依赖 | Pillow | uiautomation |
+| 屏幕阅读器标志 | 不需要 | 不修改系统标志 |
+| 依赖 | Pillow | comtypes、pillow |
 
 ## 版本历史
 
 | 版本 | 日期 | 主要变更 |
 |------|------|----------|
+| v3.7 | 2026-09-16 | 整合 Windows 便携包、comtypes UIA、计划任务、日志与测绘工具；修正状态过滤、JSON 输出、UTF-8 子进程输出、64 位桌面句柄与 XML 路径转义。macOS 保持 v3.6 实现。 |
 | v3.6 | 2026-09-11 | **关键修复**：`find_claimed_button` 误报「今日已领」。5.5.x 卡片常驻「认证领积分」白底灰描边按钮（density≈0.04）被灰度连通域当成实心灰按钮，导致脚本每次直接返回"已签到"而从不点击。修复：① 加实心度门槛 `density >= 0.5`；② 判定权威改为"深色「立即领取」按钮优先"（存在即未签到）；③ 点击后验证补"按钮消失"弱信号 |
 | v3.5 | 2026-09-10 | 适配 WorkBuddy 5.5.x：签到入口改「侧边栏 → 头像 → Buddy加油站」；新增 `cg_click_nomove()` 解决 Electron 下拉菜单"光标离开锚点即关闭"；新增 `is_sidebar_open()` 判侧边栏状态 |
 | v3.4 | 2026-09-02 | **关键修复**：主流程改「先验证再弹窗」。适配 v5.4.x「立即领取」直接领取无弹窗；修复 `ensure_running`/`activate_app` 全局差异触发 `find_bright_button` 假阳性导致点错位置、日志报成功但实际未签到的问题；弹窗分支点击后同样二次验证，未检出「今日已领」报 WARNING 并返回 False |
